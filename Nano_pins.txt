@@ -1,0 +1,102 @@
+ "CDX" Radio with Arduino Nano
+
+ use nano +5 for panel power source, feed vin with 8 or 9 volts
+ Front panel has Nano, Si5351, OLED display.
+
+Rx audio is the only A/D signal.
+
+Nano board:   ( * == off board )
+
+A0    Rx Audio In *
+A1  - Filt ID0 *     digital filter ID for 4 boards
+A2  - Filt ID1 *     determines band(s) in use
+A3  -
+A4    I2C Data
+A5    I2C Clock
+A6    
+A7    ( power out )*
+
+D0    ( Serial )
+D1    ( Serial )
+D2    Band Switch  ( 2 dpdt relays tx,rx ) *
+D3    Audio Out PWM      Timer2
+D4    Encoder A
+D5    Encoder B
+D6    Comparator input,   Timer 1 capture trigger,  Tx Audio in
+D7    Comparator reference
+D8    Encoder SW
+D9  - Dit ( timer1 PWM pin )
+D10 - Dah ( timer1 PWM pin )
+D11   Positive or Negative TX Bias PWM  Timer2 *
+D12   TX enable ( Low HCT245 enable ) *
+D13 - ( led pin )
+AREF  for RX audio level.
+
+
+Audio Sampling frequency very high at 62500 if use Timer2 interrupt.  Would need to ignore many interrupts.
+  1 of 8 interrupts - maybe could spread out CW filtering to a number of interrupts. 
+Alternate idea would be to use Timer1 and check the Compare result to see if need to set up Timer1 for transmit. When DIGI TX no longer need to sample Rx Audio in.
+
+Only need timer1 for capture when in DIGI mode TX.
+Need Positive or Negative bias for CW mode and/or for low power
+
+With 2 dpdt relays could cover 17 15 and 12 10.  Or any two of 80 40 30 20.  Or maybe 40 and 30 20. 
+
+
+
+Radio Stack using Arduino proto boards
+
+A0   Clock 0
+A1   CLock 1
+A2   Clock 2
+A3   Gnd ( clocks )
+A4   Gnd ( audio )
+A5   Audio out to Nano
+
+D0   Gnd
+D1   TxOut / Filter In
+D2   Gnd
+D3
+D4   Rx rf signal to AGC Attn
+D5   Gnd
+D6   Attn out if on separate board - RX input, Attn on rx board then get signal from D5 
+D7   Gnd
+
+D8   Gnd
+D9   Rx Prod detector out/ audio board in
+D10  AGC voltage out to attenuator
+D11
+D12  Gnd
+D13  Tx Filter out to Antenna
+GND  Gnd
+REF  ( power out if wanted )
+SDA  Filter ID0
+SCL  Filter ID1
+
+
+Spare    Band switch
+I/O ref  Tx bias
+Reset    Tx enable 
+3.3v  7 or 8 volts out
+5v    5 volts for the hct245 in the transmitter
+Gnd   Gnd
+Gnd   Gnd
+Vin   +12
+
+Should the rx be run on 5 volts from a local regulator and have no 7 volts supply.   Or
+Should the rx be run on 7 volts and the hct245 run on 5 volts from the Nano. Or
+Should the rx be run on 12 volts with dropping resistors and local 5 volts for the hct245.  Or
+Should the rx be run on 12 volts with dropping resistors and Nano supplies 5 volts for the hct245.  Or
+Should the rx and hc245 run on 5 volts from the Nano.
+
+Board Stack
+ Filter board
+ Transmitter
+ AGC Attn, Mixer, IF filter, Prod Det
+ Power Regulator, Audio Amp, AGC amp, ( agc attn? )
+
+Filter ID's
+  00   80 40
+  01   30 20   
+  10   17 15 12 10
+  11   spare 
