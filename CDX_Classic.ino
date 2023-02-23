@@ -91,10 +91,20 @@ struct BANDSTACK bandstack[NUMBANDS] = {
 #define BAND_ID1 A2
 #define DIT_PIN 9
 #define DAH_PIN 10
-#define TXENABLE 12
+//#define TXENABLE 12     // unused with new tx circuit, was hct245 enable
 #define BAND_SW 2
+#define BIAS  11
+
+#define DIT 1
+#define DAH 2
+uint8_t kmode;
+uint8_t s_tone;
+uint8_t kspeed = 14;
 
 const char msg1[] PROGMEM = "CDX Classic";
+
+uint8_t transmitting;
+int tdown;
 
 
 void setup() {
@@ -108,10 +118,12 @@ void setup() {
    pinMode( BAND_ID1, INPUT_PULLUP ); 
    pinMode( DIT_PIN, INPUT_PULLUP ); 
    pinMode( DAH_PIN, INPUT_PULLUP ); 
-   pinMode( TXENABLE, OUTPUT ); 
-   pinMode( BAND_SW, OUTPUT ); 
-   digitalWrite( TXENABLE, HIGH );      // active low on hct245, this is disabled
+   //pinMode( TXENABLE, OUTPUT ); 
+   pinMode( BAND_SW, OUTPUT );
+   pinMode( BIAS, OUTPUT );
+   //digitalWrite( TXENABLE, HIGH );      // active low on hct245, this is disabled
    digitalWrite( BAND_SW, LOW );
+   digitalWrite( BIAS, LOW );
 
    band = read_filter_id();
    freq = bandstack[band].freq;
@@ -131,17 +143,179 @@ void setup() {
    TCCR1B = 0x81;                   // noise cancel bit, divide by 1 prescale, 246 hz lower edge of xmit tone
    //TCCR1B = 0xc1;                 // rising clock on timer, don't think it really matters
    ACSR = (1<<ACIC);
-   FSKON;                           // enable capture interrupt !!! testing if enable here
+   // FSKON;                           // enable capture interrupt !!! testing if enable here
 
+   qsy(0);
 }
 
 void loop() {
+static uint32_t tm;
+int8_t t;
   
   i2poll();
-  send_tone();
 
+  t = encoder();
+
+  // temp code here !!!!
+  if( t ){ 
+     ++band;
+     if( band >= NUMBANDS ) band = 0;
+     set_bfo();
+     qsy(0);
+  }
+
+  if( tm != millis() ){            // run once per millisecond functions
+     tm = millis();
+     
+     if( mode == CW ){
+        keyer();
+     }
+     if( mode == DIGI ){
+       //vox_check();
+       if( transmitting ) send_tone();
+     }
+
+     if( tdown && s_tone == 0 ){       // semi break in delay
+        if( --tdown == 0 ) rx();
+     }
+  }
 
 }
+
+
+/****************  some CW mode code ******************/
+
+
+int8_t read_paddles(){
+int8_t pdl;
+
+   pdl = 0;
+   if( digitalRead( DAH_PIN ) == LOW ) pdl = 2;
+   if( digitalRead( DIT_PIN ) == LOW ) pdl += 1;
+   
+   if( kmode & 4 ){                        // swap paddles 
+      pdl <<= 1;
+      if( pdl & 4 ) pdl += 1;
+      pdl &= 3;                            // wire straight key to ring of plug
+   }
+
+   return pdl;
+}
+
+void side_tone_on(){
+   
+   s_tone = 1;
+   if( transmitting == 0 ) tx();
+   //digitalWrite( TXENABLE, LOW );        // hc245 enable pin active low  
+   digitalWrite( BIAS, HIGH );
+   
+}
+
+void side_tone_off(){
+
+   s_tone = 0;
+   //digitalWrite( TXENABLE, HIGH );        // hc245 enable pin active low
+   digitalWrite( BIAS, LOW );     
+   tdown = 400;                      // return to rx between letters
+}
+
+
+/*
+void ptt(){                        // ssb PTT or straight key via keyer() function
+static uint16_t dbounce;
+static int8_t txing;                  // local dupe of variable transmitting.  uses: delayed breakin, wave shaping, practice mode
+int8_t pdl;
+
+   pdl = digitalRead( PTT ) ^ 1; 
+   dbounce >>= 1;                  // shift bits right, any bit as 1 counts as on, no bits is off, stretches on time slightly
+   if( pdl ) dbounce |= 0x400;     // 1ms delay per bit debounce, 0x400 is 15ms, 0x80 is 8ms
+
+   if( mode == CW ){               // straight key mode
+      if( txing && dbounce == 0 ) txing = 0, side_tone_off();
+      else if( txing == 0 && dbounce ) txing = 1, side_tone_on();
+   }
+   else{                           // SSB
+      if( txing && dbounce == 0 ) txing = 0 , rx();
+      else if( txing == 0 && dbounce ) txing = 1, tx(); 
+   }
+}
+*/
+
+
+// http://cq-cq.eu/DJ5IL_rt007.pdf      all about the history of keyers
+
+#define WEIGHT 200        // extra weight for keyed element
+
+void keyer( ){            // this function is called once every millisecond
+static int8_t state;
+static int count;
+static int8_t cel;           // current element
+static int8_t nel;           // next element - memory
+static int8_t arm;           // edge triggered memory mask
+static int8_t iam;           // level triggered iambic mask
+int8_t pdl;
+
+
+//   if( (kmode & 3) == 0 ){    // straight key mode
+//      ptt();
+//      return;
+//   }
+   pdl = read_paddles();
+   if( count ) --count;
+
+   switch( state ){
+     case 0:                               // idle
+        cel = ( nel ) ? nel : pdl;         // get memory or read the paddles
+        nel = 0;                           // clear memory
+        if( cel == DIT + DAH ) cel = DIT;
+        if( cel == 0 ) break;
+        iam = (DIT+DAH) ^ cel;
+        arm = ( iam ^ pdl ) & iam;         // memory only armed if alternate paddle is not pressed at this time, edge trigger
+                                                    // have set up for mode A
+        if( (kmode & 3) == 2 ) arm = iam;           // mode B.  Level triggered memory.
+        if( (kmode & 3) == 3 ) iam = cel;           // ultimatic mode
+        
+        count = (1200+WEIGHT)/kspeed;
+        if( cel == DAH ) count *= 3;
+        state = 1;
+        side_tone_on();
+     break; 
+     case 1:                                  // timing the current element. look for edge of the other paddle
+        if( count ) nel = ( nel ) ? nel : pdl & arm;
+        else{
+           count = 1200/kspeed;
+           state = 2;
+           side_tone_off();
+        }
+     break;   
+     case 2:                                  // timing the inter-element space
+        if( count ) nel = ( nel ) ? nel : pdl & arm;
+        else{
+           nel = ( nel ) ? nel : pdl & iam;   // sample alternate at end of element and element space
+           state = 0;
+        }
+     break;   
+   }
+  
+}
+
+
+
+void tx(){                // change to transmit
+
+    set_tx_clk();
+    transmitting = 1;
+}
+
+void rx(){                // change to receive
+
+    set_bfo();
+    transmitting = 0;
+}
+
+
+
+/***************************************************/
 
 
 ISR( TIMER1_CAPT_vect ){
@@ -183,29 +357,44 @@ uint16_t divi;
   si_load_divider( divi, 0, 0 );       // divider for clock 0
   
   si_pll_x( PLLA, bfo, 98 );
-  si_load_divider( 98, 2, 0 );        // keep clock 2 in step with clock 1 but disabled
+  //si_load_divider( 98, 2, 0 );        // keep clock 2 in step with clock 1 but disabled
   si_load_divider( 98, 1, 1 );        // clock 1, reset all
   i2cd( SI5351, 3, 0b11111100 );      // enable vfo, bfo outputs, assumes rx is active
+  i2flush();
+  delayMicroseconds(1500);            // same clock delay needed here?
 }
 
 // si5351 part of changing to tx mode
 void set_tx_clk(){
 uint32_t f;
 uint16_t divi;
+uint8_t  drive;
 
    i2cd( SI5351, 3, 0b11111111 );
    f = freq;
    if( mode == CW ) f -= CW_OFFSET;
    divi = bandstack[band].t_div;
    si_pll_x( PLLA, f, divi );
-   si_load_divider( divi, 1, 0 );
+   //si_load_divider( divi, 1, 0 );
    si_load_divider( divi, 2, 1 );
-   i2cd( SI5351, 3, 0b11111001 );     // clocks 1 and 2 180 degrees phase diff
+
+   // see if the si5351 drive effects power out, lower drive for 80,40,30 meters
+   // does not seem to be useful in reducing power of lower frequencies
+   // but less drive may reduce the 2nd harmonic
+   // less drive on higher bands reduces the power significantly
+   drive = ( band > 3 ) ? 3 : band;
+   i2cd( SI5351, 18, 0x4C + drive );
+   
+   i2cd( SI5351, 3, 0b11111011 );     // clock 2 on
+   i2flush();
+   delayMicroseconds(1500);           // clock takes awhile to start up, then add bs170 bias
 
 }
 
 void qsy( int val ){
 
+   freq += val;
+   display_freq();
   
 }
 
@@ -234,11 +423,12 @@ static float err;
       val =  16000000.0 / (float)raw;
       si_tone_offset( val );
       
-      tone_testing( val );
+      // tone_testing( val );
    }
 
 }
 
+/*********
 void tone_testing( float val ){
 static float t0,t1,t2,t3;
 static uint32_t tm;
@@ -258,6 +448,7 @@ static uint32_t tm;
    LCD.printNumF(t1-t0,2,60,ROW3);
    tm = millis();  
 }
+***********/
 
 uint16_t median( uint16_t val ){             // remove outliers
 static uint16_t vals[3];
@@ -295,13 +486,32 @@ void si5351_init(){
 uint8_t reg, data;
 int i;
 
+     delay(20);
      for( i = 0; i < 513; ++i ){
         reg = pgm_read_byte( &si5351_reg[i++] );
         data = pgm_read_byte( &si5351_reg[i] );
         if( reg == 255 ) break;         // end file marker
         i2cd( SI5351, reg, data );
+        //Serial.print( reg );   Serial.write(' ');
+        //Serial.println(data);
      }
-     i2cd( SI5351, 177, 0xAC );         // PLLA PLLB soft reset
+
+        // set some divider registers that will never change
+   for(int i = 0; i < 3; ++i ){
+     i2cd(SI5351,42+8*i,0);
+     i2cd(SI5351,43+8*i,1);
+     i2cd(SI5351,47+8*i,0);
+     i2cd(SI5351,48+8*i,0);
+     i2cd(SI5351,49+8*i,0);
+   }
+
+   i2flush();
+
+   i2cd( SI5351, 177, 0xAC );         // PLLA PLLB soft reset
+   i2flush();
+   delay(10);
+   i2cd( SI5351, 177, 0xAC );
+   i2flush();
 }
 
 void i2cd( unsigned char addr, unsigned char reg, unsigned char dat ){
@@ -610,3 +820,54 @@ static uint8_t first_read;
 }
 
 /*********** end I2C functions  ************/
+
+
+void display_freq(){
+int rem;
+uint32_t f;
+static uint8_t msg_displayed;                      // write the RIT message only once
+
+
+  // if( rit_enabled == 0 ) msg_displayed = 0;
+   f = freq;
+   if( mode == CW ) f -= CW_OFFSET;      // !!! revisit
+   
+   rem = f % 1000;
+
+    // display big numbers in the blue area of the screen
+    // font widths/height are: small 6 x 8, Medium 12 x 16, Big 14 x 24
+    LCD.setFont(BigNumbers);
+    LCD.printNumI(f/1000,12,ROW2,5,'/');
+    LCD.setFont(MediumNumbers);
+    LCD.printNumI(rem,5*14 + 12 + 3,ROW3,3,'0');
+    LCD.setFont( SmallFont );                                                        // keep OLED in small text as the default font
+   // if( rit_enabled && msg_displayed == 0 ) p_msg( msg2, 6 ), msg_displayed = 1;     // RIT message
+   // LCD.gotoRowCol( 3,0 );
+   // LCD.putch( band_priv(f));
+ 
+}
+
+
+int8_t encoder(){         /* read encoder, return 1, 0, or -1 */
+static char mod;        /* encoder is divided by 4 because it has detents */
+static char dir;        /* need same direction as last time, effective debounce */
+static char last;       /* save the previous reading */
+char new_;              /* this reading */
+char b;
+
+   //if( transmitting ) return 0;
+   
+   new_ = (digitalRead(ENC_B) << 1 ) | digitalRead(ENC_A);
+   if( new_ == last ) return 0;       /* no change */
+
+   b = ( (last << 1) ^ new_ ) & 2;    /* direction 2 or 0 from xor of last shifted and new data */
+   last = new_;
+   if( b != dir ){
+      dir = b;
+      return 0;      /* require two in the same direction serves as debounce */
+   }
+   mod = (mod + 1) & 3;       /* divide by 4 for encoder with detents */
+   if( mod != 0 ) return 0;
+
+   return ( (dir == 2 ) ? 1: -1 );   /* swap defines ENC_A, ENC_B if it works backwards */
+}
