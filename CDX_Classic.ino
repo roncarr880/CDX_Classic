@@ -5,11 +5,24 @@
  *  
  *  vfo is clock 0 using PLLB, high side vfo
  *  bfo is clock 1 using PLLA
- *  transmit uses clock 1 and 2 with 180 deg phase diff
+ *  transmit uses clock 2
+ *  
+ *  Timer2
+ *    D3 is audio out pwm, D11 is transmitter bias.
+ *    TCCR2A  10 10 0011 for fast pwm, 1000 0011 enables ouput pin A, 0010 0011 enables pin B, A is bias, B is audio
+ *    TCCR2B  0x01 for fastest clock
+ *    TIMSK2  0x01 for overflow interrutps for audio
+ *    Load OCR2A for bias value, OCR2B for audio
+ *    
+ *  Turning clocks on and off or reseting Si5351 causes TX glitch.  Caused by capacitive coupling of the clock?
+ *    Fixed by keying the driver circuit.
+ *    
  */
 
+#define SWAP_TAP_DTAP 1         // swap the button tap and dtap, tap selects, dtap changes now 
+
 #define SI5351 0x60     // I2C address
-#define CLOCK_FREQ 25001740L
+#define CLOCK_FREQ 25000045L
 //  starting addresses of phase lock loop registers
 #define PLLA 26
 #define PLLB 34
@@ -26,6 +39,16 @@
 #define ROW6  48
 #define ROW7  56
 
+  /* switch states */
+#define IDLE_ 0
+#define ARM  1
+#define DARM 2
+#define DONE 3
+#define TAP  4
+#define DTAP 5
+#define LONGP 6
+
+
 #define I2TBUFSIZE 64              // size power of 2.  max 256 as using 8 bit index
 #define I2RBUFSIZE 2               // set to expected #of reads, power of 2.  Won't be doing any reads in this program.
 #define I2INT_ENABLED 0            // 0 for polling in loop or timer, 1 for TWI interrupts
@@ -35,6 +58,13 @@
 #define USB  2
 #define LSB  3
 #define CW_OFFSET 650
+
+#define T2_BIAS 0x80
+#define T2_AUDIO 0x20
+
+#define BFO (9000000+400)        // bfo on the high side of the xtal filter ( set first, lsb? )
+#define BW  -2400                // band width of the xtal filter, bfo on low side is BFO - BW
+                                 // this works backwards from what I expected  
 
 //  I2C buffers and indexes
 unsigned int i2buf[I2TBUFSIZE];   // writes
@@ -62,6 +92,9 @@ uint32_t freq;
 uint32_t bfo;
 uint8_t  mode;
 uint8_t  band;
+int16_t   step_ = 1000;
+uint8_t   stp = 2;
+uint8_t  gain;
 
 struct BANDSTACK {
    uint32_t   freq;
@@ -69,18 +102,20 @@ struct BANDSTACK {
    uint16_t   t_div;      // tx vfo = freq
    uint8_t    mode;
    uint8_t    filt_id;    // low pass filter ID for band selection, two bands per board, 4 boards possible, + ls bit is relay state
+   uint8_t    cw_pwr;     // pwm bias drive for modes
+   uint8_t    digi_pwr;
 };
 
 #define NUMBANDS 8
 struct BANDSTACK bandstack[NUMBANDS] = {
-  {  3600000, 54, 220, CW, 0},
-  {  7100000, 44, 122, CW, 1},
-  { 10110000, 36,  86, CW, 2},
-  { 14100000, 30,  62, CW, 3},
-  { 18100000, 26,  50, CW, 4},
-  { 21100000, 24,  40, CW, 4},
-  { 24900000, 20,  36, CW, 5},
-  { 28100000, 18,  30, CW, 5}
+  {  3928000, 54, 220, LSB, 0,  52,  25},
+  {  7250000, 44, 122,LSB, 1, 101,  50},     //100
+  { 10110000, 36,  86, CW, 2, 142,  70},     //140
+  { 14100000, 30,  62, CW, 3, 201, 100},     //200
+  { 18100000, 26,  50, CW, 6, 255, 120},     //240
+  { 21100000, 24,  40, CW, 6, 255, 200},
+  { 24900000, 20,  36, CW, 7, 255, 255},
+  { 28100000, 18,  30, CW, 7, 255, 255}
 };
 
 // pin definitions
@@ -91,9 +126,10 @@ struct BANDSTACK bandstack[NUMBANDS] = {
 #define BAND_ID1 A2
 #define DIT_PIN 9
 #define DAH_PIN 10
-//#define TXENABLE 12     // unused with new tx circuit, was hct245 enable
-#define BAND_SW 2
+#define TXENABLE 12     // wired to reset on stack
+#define BAND_SW 2       // wired to 3.3 on stack
 #define BIAS  11
+#define AUDIO 3
 
 #define DIT 1
 #define DAH 2
@@ -105,6 +141,19 @@ const char msg1[] PROGMEM = "CDX Classic";
 
 uint8_t transmitting;
 int tdown;
+
+uint8_t ad_ref = 0x40;        // 0x40 5 volt, 0xc0 is 1.1 volt ( +13db )
+uint8_t vol = 30;
+uint8_t svol = 20;
+uint8_t sstate[1];            // button switch state array
+
+#define FREQ 0
+#define VOLUME 1
+#define SVOLUME 2
+#define KSPEED 3
+uint8_t enc_user;
+
+int db_counter;               // !!! debug
 
 
 void setup() {
@@ -118,14 +167,15 @@ void setup() {
    pinMode( BAND_ID1, INPUT_PULLUP ); 
    pinMode( DIT_PIN, INPUT_PULLUP ); 
    pinMode( DAH_PIN, INPUT_PULLUP ); 
-   //pinMode( TXENABLE, OUTPUT ); 
+   pinMode( TXENABLE, OUTPUT ); 
    pinMode( BAND_SW, OUTPUT );
    pinMode( BIAS, OUTPUT );
-   //digitalWrite( TXENABLE, HIGH );      // active low on hct245, this is disabled
+   pinMode( AUDIO, OUTPUT );        
+   digitalWrite( TXENABLE, LOW );
    digitalWrite( BAND_SW, LOW );
    digitalWrite( BIAS, LOW );
 
-   band = read_filter_id();
+   band = read_filter_id(); 
    freq = bandstack[band].freq;
    
    i2init();
@@ -135,6 +185,7 @@ void setup() {
    p_msg( msg1,0 );
 
    si5351_init();
+   set_timer2( T2_AUDIO );
    set_bfo();
 
   // digi mode setup
@@ -146,22 +197,46 @@ void setup() {
    // FSKON;                           // enable capture interrupt !!! testing if enable here
 
    qsy(0);
+   analogRead( A0 );                // init analog system
+   if( bandstack[band].filt_id & 1 ) digitalWrite(BAND_SW,HIGH);
+   else digitalWrite(BAND_SW,LOW);
+
+   
 }
 
 void loop() {
 static uint32_t tm;
 int8_t t;
+static int sec;
   
   i2poll();
 
   t = encoder();
+  if( t ){
+    switch( enc_user ){
+      case FREQ:  qsy( t * step_ );  break;
+      case VOLUME:
+         vol += t;
+         vol = constrain( vol, 0, 63 );
+         status_display2();  
+      break;
+      case SVOLUME:
+         svol += t;
+         svol = constrain( svol, 0, 63 );
+         status_display2();
+      break;
+      case KSPEED:
+         kspeed += t;
+         kspeed = constrain( kspeed, 10, 25 );
+         status_display2();
+      break;
+    }
+  }
 
-  // temp code here !!!!
-  if( t ){ 
-     ++band;
-     if( band >= NUMBANDS ) band = 0;
-     set_bfo();
-     qsy(0);
+  t = switches();
+  if( t > DONE ){
+     button( t );
+     sstate[0] = DONE;
   }
 
   if( tm != millis() ){            // run once per millisecond functions
@@ -177,6 +252,14 @@ int8_t t;
 
      if( tdown && s_tone == 0 ){       // semi break in delay
         if( --tdown == 0 ) rx();
+     }
+
+     ++sec;
+     if( sec == 50 ){
+        sec = 0;
+        Serial.print(16); Serial.write(' '); Serial.print(-16); Serial.write(' ');
+        noInterrupts();   int val = db_counter; interrupts();
+        Serial.println( val );
      }
   }
 
@@ -205,17 +288,23 @@ int8_t pdl;
 void side_tone_on(){
    
    s_tone = 1;
-   if( transmitting == 0 ) tx();
-   //digitalWrite( TXENABLE, LOW );        // hc245 enable pin active low  
-   digitalWrite( BIAS, HIGH );
+   if( transmitting == 0 ){
+      tx();
+      i2cd( SI5351,3,0b11111011);
+      i2flush();
+   }
+   OCR2A = bandstack[band].cw_pwr;
+   digitalWrite( TXENABLE, HIGH );
    
 }
 
 void side_tone_off(){
 
    s_tone = 0;
-   //digitalWrite( TXENABLE, HIGH );        // hc245 enable pin active low
-   digitalWrite( BIAS, LOW );     
+   digitalWrite( TXENABLE, LOW );
+   OCR2A = 0;
+   // delay(1);
+   // i2cd(SI5351,3,0xff);           // do we need to key the drive?
    tdown = 400;                      // return to rx between letters
 }
 
@@ -302,13 +391,18 @@ int8_t pdl;
 
 
 void tx(){                // change to transmit
+uint8_t t_mode;
 
+    t_mode = T2_BIAS;
+    if( mode == CW ) t_mode += T2_AUDIO;     // enable sidetone out
+    set_timer2( t_mode );
     set_tx_clk();
     transmitting = 1;
 }
 
 void rx(){                // change to receive
 
+    set_timer2( T2_AUDIO );
     set_bfo();
     transmitting = 0;
 }
@@ -316,6 +410,66 @@ void rx(){                // change to receive
 
 
 /***************************************************/
+
+void set_timer2( uint8_t fun ){
+
+    noInterrupts();
+    OCR2A = 0;   OCR2B = 128;            // off values
+    if( (fun & T2_AUDIO) == T2_AUDIO ) TIMSK2 = 1;
+    else TIMSK2 = 0;
+
+    TCCR2A = fun | 0x3;                  // fast pwm mode
+    TCCR2B = ( fun ) ? 0x01 : 0x00;      // clock 63.5 khz or off
+    //pinMode( 3, OUTPUT );
+    //pinMode( 11, OUTPUT );
+    interrupts();
+}
+
+
+
+#define ADPS 7                      // conversion speed, make as long as possible, a value of 3-4 should work at 63.5k
+
+ISR( TIMER2_OVF_vect ){             // audio.  Rx sample rate 63.5 / 8 == 7.9375
+static uint8_t state;
+//static int adc;
+static int val;
+static uint8_t agc_counter;
+//static uint8_t agc_recover;
+//static int16_t sig_level;
+static int agc;
+//static int agc2;
+//static uint8_t bits;
+
+  // receiver
+  ++state;
+  state &= 7;
+  switch( state ){
+    case 0:
+      val = ADC - 512;               // read adc and que next conversion
+      ADMUX = ad_ref | 0;            // conversion on channel zero 
+      ADCSRA = 0xC0 + ADPS;
+      db_counter = val;              // !!! debug
+    break;
+    case 1:
+      if( ++agc_counter == 0 ){
+         if( agc < vol ) ++agc;
+         if( agc > vol ) --agc;
+      }
+    break;     
+    case 2:   break;
+    case 3:   break;
+    case 4:   break;
+    case 5:   break;
+    case 6:   break;
+    case 7:                          // write result
+       val *= agc;
+       val >>= 6;
+       OCR2B = constrain(val+128,0,255);
+       if( (abs(val)) > 2*(int)vol && agc > 0 ) --agc;     // volume ranges 0 to 63, signal +- 128
+    break;
+  }
+  
+}
 
 
 ISR( TIMER1_CAPT_vect ){
@@ -328,6 +482,7 @@ uint16_t now;
    if( raw_tone > 5000 ) tone_flag = 1;    // else short count
 }
 
+
 uint8_t read_filter_id(){
 uint8_t id;
 uint8_t band;
@@ -337,8 +492,26 @@ uint8_t i;
    band = id = 0;
    if( digitalRead( BAND_ID0 ) == HIGH ) id += 2;
    if( digitalRead( BAND_ID1 ) == HIGH ) id += 4;
-   for( i = 0; i < NUMBANDS; ++i ) if( id == bandstack[i].filt_id ) band = i;
+   for( i = 0; i < NUMBANDS; ++i ){
+      if( id == bandstack[i].filt_id ){
+         band = i;
+         break;
+      }
+   }
    return band;      
+}
+
+
+void band_change( uint8_t old_band ){
+
+    bandstack[old_band].freq = freq;
+    bandstack[old_band].mode = mode;
+    freq = bandstack[band].freq;
+    set_bfo();
+    qsy(0);
+    if( bandstack[band].filt_id & 1 ) digitalWrite(BAND_SW,HIGH);
+    else digitalWrite(BAND_SW,LOW);
+
 }
 
 // since we have a PLL reset here, set up the vfo also. can use this function for band change also.
@@ -346,22 +519,23 @@ void set_bfo(){
 uint16_t divi;
 
   i2cd( SI5351, 3, 0b11111111 );       // clocks off
+  i2flush();
 
   mode = bandstack[band].mode;
-  if( mode == DIGI || mode == USB ) bfo = 9000000;
-  else bfo = 9004000;
+  if( mode == DIGI || mode == USB ) bfo = BFO - BW;
+  else bfo = BFO;
   
   divi = bandstack[band].r_div;
-  freq = bandstack[band].freq;
   si_pll_x( PLLB, freq+bfo, divi);
   si_load_divider( divi, 0, 0 );       // divider for clock 0
   
   si_pll_x( PLLA, bfo, 98 );
   //si_load_divider( 98, 2, 0 );        // keep clock 2 in step with clock 1 but disabled
   si_load_divider( 98, 1, 1 );        // clock 1, reset all
+  i2flush();
   i2cd( SI5351, 3, 0b11111100 );      // enable vfo, bfo outputs, assumes rx is active
   i2flush();
-  delayMicroseconds(1500);            // same clock delay needed here?
+  //delayMicroseconds(1500);            // same clock delay needed here?
 }
 
 // si5351 part of changing to tx mode
@@ -371,23 +545,23 @@ uint16_t divi;
 uint8_t  drive;
 
    i2cd( SI5351, 3, 0b11111111 );
+   i2flush();
    f = freq;
    if( mode == CW ) f -= CW_OFFSET;
    divi = bandstack[band].t_div;
    si_pll_x( PLLA, f, divi );
    //si_load_divider( divi, 1, 0 );
    si_load_divider( divi, 2, 1 );
+   i2flush();
 
-   // see if the si5351 drive effects power out, lower drive for 80,40,30 meters
-   // does not seem to be useful in reducing power of lower frequencies
-   // but less drive may reduce the 2nd harmonic
-   // less drive on higher bands reduces the power significantly
+   // see if the si5351 drive effects power out, less drive for 80,40,30 meters
+   // !!! put this in band change instead of here
    drive = ( band > 3 ) ? 3 : band;
    i2cd( SI5351, 18, 0x4C + drive );
    
    i2cd( SI5351, 3, 0b11111011 );     // clock 2 on
    i2flush();
-   delayMicroseconds(1500);           // clock takes awhile to start up, then add bs170 bias
+   delayMicroseconds(1250);           // clock takes awhile to start up, then add bias
 
 }
 
@@ -395,6 +569,7 @@ void qsy( int val ){
 
    freq += val;
    display_freq();
+   si_pll_x( PLLB, freq+bfo, bandstack[band].r_div);
   
 }
 
@@ -830,7 +1005,7 @@ static uint8_t msg_displayed;                      // write the RIT message only
 
   // if( rit_enabled == 0 ) msg_displayed = 0;
    f = freq;
-   if( mode == CW ) f -= CW_OFFSET;      // !!! revisit
+   //if( mode == CW ) f -= CW_OFFSET;      // !!! revisit
    
    rem = f % 1000;
 
@@ -870,4 +1045,149 @@ char b;
    if( mod != 0 ) return 0;
 
    return ( (dir == 2 ) ? 1: -1 );   /* swap defines ENC_A, ENC_B if it works backwards */
+}
+
+
+      /* run the switch state machine, generic code for multiple switches even though have only one here */
+int8_t switches(){
+static uint8_t press_, nopress;
+static uint32_t tm;
+int  i,j;
+int8_t sw;
+int8_t s;
+
+   if( tm == millis() ) return 0;      // run once per millisecond
+   tm = millis();
+   
+   sw = ( digitalRead( ENC_SW ) == LOW ) ? 1 : 0;                 
+   
+   if( sw ) ++press_, nopress = 0;       /* only acting on one switch at a time */
+   else ++nopress, press_ = 0;           /* so these simple vars work for all of them */
+
+   /* run the state machine for all switches in a loop */
+   for( i = 0, j = 1; i < 1; ++i ){
+      s = sstate[i];
+      switch(s){
+         case DONE:  if( nopress >= 100 ) s = IDLE_;  break;
+         case IDLE_:  if( ( j & sw ) && press_ >= 30 ) s = ARM;  break; /* pressed */
+         case ARM:
+            if( nopress >= 30 ) s = DARM;                      /* it will be a tap or double tap */
+            if( press_ >= 240 ) s = LONGP;                     // long press
+         break;
+         case DARM:
+            if( nopress >= 240 )  s = TAP;
+            if( press_ >= 30 )    s = DTAP;
+         break;
+      }
+      sstate[i] = s; 
+      j <<= 1;
+   }
+   
+   return sstate[0];      // only one switch implemented so can return its value
+}
+
+#define NUM_MENU 5
+uint8_t *svar[NUM_MENU] =                  // variables to change
+{&stp, &band, &mode, &kmode, &gain };
+uint8_t smax[NUM_MENU] =                   // max value allowed
+{ 4,      8,     4,      4,     2 };
+
+
+// tap inc value, dtap inc function, long change encoder user.  status_display
+void button( int8_t val ){
+static uint8_t function;
+int i;
+uint8_t ob;
+
+  ob = band;
+
+  if( SWAP_TAP_DTAP ){                   // tap selects value, dtap changes value now
+    if( val == TAP ) val = DTAP;
+    else if( val == DTAP ) val = TAP;
+  }
+
+  switch( val ){
+    case TAP:
+      ++*svar[function];
+      if( *svar[function] >= smax[function] ) *svar[function] = 0;
+      
+      // special case freq step
+      if( function == 0 ){
+         step_ = 10;  i = stp;
+         while( i-- ) step_ *= 10;
+      }
+      
+      // special case weak signal gain       
+      if( function == 4 ){
+         ad_ref = ( gain ) ? 0xc0 : 0x40;   // 0x40 5 volt, 0xc0 is 1.1 volt ( +13db )
+      }
+
+      if( function == 1 ) band_change(ob);
+      if( function == 2 ) {                  // mode change
+         band_change(band);                  // implement as band change to same band
+      }
+      
+    break;
+
+    case DTAP:
+      if( ++function > NUM_MENU-1 ) function = 0;
+    break;
+
+    case LONGP:
+      if( ++enc_user > 3 ) enc_user = 0;
+    break;
+  }
+
+  status_display( function );
+  
+}
+
+const char status_msg[] PROGMEM = "StepBandModeKeyMGain";
+const char modes_msg[] PROGMEM = " CW DIGIUSB LSB ";
+const char enc_msg[] PROGMEM = "FreqVol SVolKspd";
+void status_display( uint8_t f ){
+int i,k;
+
+  LCD.clrRow(0);
+  LCD.gotoRowCol( 0,0 );
+  k = 4*f;                 // index msg
+  for( i = 0; i < 4; ++i ) LCD.putch( pgm_read_byte( &status_msg[k++] ) );
+  LCD.putch(' ');
+  
+  switch( f ){
+    case 0:  LCD.printNumI( step_, 6*6, 0 ); break;
+    case 2:
+      k = 4 * mode;
+      LCD.gotoRowCol( 0, 6*6 );
+      for( i = 0; i < 4; ++i ) LCD.putch( pgm_read_byte( &modes_msg[k++] ) );
+      LCD.putch(' ');
+    break;  
+    default:  LCD.printNumI( *svar[f],6*6,0 ); break;
+  }
+
+  status_display2();
+  
+}
+
+void status_display2(){      // display encoder user status
+int i,k;
+
+  LCD.clrRow(1);
+  LCD.gotoRowCol( 1,0 );
+  k = 4*enc_user;
+  for( i = 0; i < 4; ++i ) LCD.putch( pgm_read_byte( &enc_msg[k++] ) );
+
+  switch( enc_user ){
+    case 1:
+       LCD.printNumI( vol, 6*6, ROW1 );
+    break;
+    case 2:
+       LCD.printNumI( svol, 6*6, ROW1 );
+    break;
+    case 3:
+       LCD.printNumI( kspeed, 6*6,ROW1 );
+    break;
+  }
+
+  
 }

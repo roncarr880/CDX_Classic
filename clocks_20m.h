@@ -84,7 +84,7 @@ const uint8_t si5351_reg[] PROGMEM = {
  // 0, 0x00,
  // 1, 0x00,
  // 2, 0x18,
- // 3, 0xff,     // clocks off 0x00,
+  3, 0xff,     // clocks off 0x00,
  // 4, 0x00,
  // 5, 0x00,
  // 6, 0x00,
@@ -97,15 +97,16 @@ const uint8_t si5351_reg[] PROGMEM = {
  //13, 0x00,
  //14, 0x00,
  15, 0x00,
- 16, 0x6C,     // clock 0, PLLB, vfo
- 17, 0x4C,     // clock 1, PLLA and now not inverted, bfo
- 18, 0x4F,     // clock 2, PLLA, tx
+ 16, 0x6C,     // clock 0, PLLB, vfo, 2ma
+ 17, 0x4C,     // clock 1, PLLA and now not inverted, bfo, 2ma
+ 18, 0x4F,     // clock 2, PLLA, tx, 8ma
  19, 0x80,
  20, 0x80,
  21, 0x80,
  22, 0x80,     // was 0xC0, turn off PLLA integer mode, we want to move the bfo around
  23, 0x80,     // PLLB is in non-integer mode as set by clock builder
- 24, 0x10,     // 0x00,  CLK2 idles high when disabled, tx glitch fix?
+ 24, 0x00,     // 0x00, 0x10 CLK2 idles high when disabled, tx glitch fix?  Band switch tx bump.
+ //24, 0x20,       // try clock2 as floating when disabled
  25, 0x00,
  26, 0x00,
  27, 0x01,
