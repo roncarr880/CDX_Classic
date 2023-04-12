@@ -112,8 +112,8 @@ struct BANDSTACK bandstack[NUMBANDS] = {
   {  7250000, 44, 122,LSB, 1, 101,  50},     //100
   { 10110000, 36,  86, CW, 2, 142,  70},     //140
   { 14100000, 30,  62, CW, 3, 201, 100},     //200
-  { 18100000, 26,  50, CW, 6, 255, 120},     //240
-  { 21100000, 24,  40, CW, 6, 255, 200},
+  { 18100000, 26,  50, DIGI, 7, 255, 120},   //240  was id 6 but rx band switch works better with this setting
+  { 21100000, 24,  40, CW, 7, 255, 200},
   { 24900000, 20,  36, CW, 7, 255, 255},
   { 28100000, 18,  30, CW, 7, 255, 255}
 };
@@ -246,7 +246,7 @@ static int sec;
         keyer();
      }
      if( mode == DIGI ){
-       //vox_check();
+       vox_check();
        if( transmitting ) send_tone();
      }
 
@@ -257,7 +257,7 @@ static int sec;
      ++sec;
      if( sec == 50 ){
         sec = 0;
-        Serial.print(16); Serial.write(' '); Serial.print(-16); Serial.write(' ');
+        //Serial.print(16); Serial.write(' '); Serial.print(-16); Serial.write(' ');
         noInterrupts();   int val = db_counter; interrupts();
         Serial.println( val );
      }
@@ -287,7 +287,7 @@ int8_t pdl;
 
 void side_tone_on(){
    
-   s_tone = 1;
+   if( mode == CW ) s_tone = 1;        // this function also keys tx during DIGI mode, but no side tone           
    if( transmitting == 0 ){
       tx();
       i2cd( SI5351,3,0b11111011);
@@ -448,7 +448,7 @@ static int agc;
       val = ADC - 512;               // read adc and que next conversion
       ADMUX = ad_ref | 0;            // conversion on channel zero 
       ADCSRA = 0xC0 + ADPS;
-      db_counter = val;              // !!! debug
+     // db_counter = val;              // !!! debug
     break;
     case 1:
       if( ++agc_counter == 0 ){
@@ -493,7 +493,7 @@ uint8_t i;
    if( digitalRead( BAND_ID0 ) == HIGH ) id += 2;
    if( digitalRead( BAND_ID1 ) == HIGH ) id += 4;
    for( i = 0; i < NUMBANDS; ++i ){
-      if( id == bandstack[i].filt_id ){
+      if( id == ( bandstack[i].filt_id & 6 ) ){
          band = i;
          break;
       }
@@ -536,6 +536,8 @@ uint16_t divi;
   i2cd( SI5351, 3, 0b11111100 );      // enable vfo, bfo outputs, assumes rx is active
   i2flush();
   //delayMicroseconds(1500);            // same clock delay needed here?
+  if( mode == DIGI ) FSKON;
+  else FSKOFF;
 }
 
 // si5351 part of changing to tx mode
@@ -573,6 +575,21 @@ void qsy( int val ){
   
 }
 
+void vox_check(){
+static uint8_t vox;
+
+   noInterrupts();
+   if( tone_flag ){
+      vox = 10;
+   }
+   else if( vox ) --vox;
+   interrupts();
+
+   if( vox && transmitting == 0 ) side_tone_on();
+   else if( transmitting && vox == 0 && tdown == 0 ) side_tone_off();
+  
+}
+
 void send_tone(){
 float val;
 uint16_t raw;
@@ -581,7 +598,7 @@ static float last_val;
 static float err;
 
    raw = 0;
-   //if( transmitting == 0 ) return;
+   if( transmitting == 0 ) return;
    noInterrupts();
      if( tone_flag ){
         raw = raw_tone;
@@ -597,7 +614,8 @@ static float err;
       // sending the median of 3 values
       val =  16000000.0 / (float)raw;
       si_tone_offset( val );
-      
+
+      db_counter = val;
       // tone_testing( val );
    }
 
