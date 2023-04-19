@@ -29,6 +29,7 @@
 
 #include <OLED1306_Basic.h>
 #include "clocks_20m.h"         // full si5351 init from clockbuilder desktop
+#include "sine_cosine.h"
 
 #define ROW0   0
 #define ROW1   8
@@ -55,8 +56,9 @@
 
 #define CW 0
 #define DIGI 1
-#define USB  2
-#define LSB  3
+#define WSPR 2                     // tx power reduced from DIGI power
+#define USB  3
+#define LSB  4
 #define CW_OFFSET 650
 
 #define T2_BIAS 0x80
@@ -104,18 +106,19 @@ struct BANDSTACK {
    uint8_t    filt_id;    // low pass filter ID for band selection, two bands per board, 4 boards possible, + ls bit is relay state
    uint8_t    cw_pwr;     // pwm bias drive for modes
    uint8_t    digi_pwr;
+   uint8_t    wspr_pwr;
 };
 
 #define NUMBANDS 8
 struct BANDSTACK bandstack[NUMBANDS] = {
-  {  3928000, 54, 220, LSB, 0,  52,  25},
-  {  7250000, 44, 122,LSB, 1, 101,  50},     //100
-  { 10110000, 36,  86, CW, 2, 142,  70},     //140
-  { 14100000, 30,  62, CW, 3, 201, 100},     //200
-  { 18100000, 26,  50, DIGI, 7, 255, 120},   //240  was id 6 but rx band switch works better with this setting
-  { 21100000, 24,  40, CW, 7, 255, 200},
-  { 24900000, 20,  36, CW, 7, 255, 255},
-  { 28100000, 18,  30, CW, 7, 255, 255}
+  {  3928000, 54, 220, LSB,  0,  50,  25, 0},      //
+  {  7250000, 44, 122, LSB,  1,  50,  25, 0},      //
+  { 10138700, 36,  86, WSPR, 2,  55,  25, 0},      // ID1 soft ground low
+  { 14100000, 30,  62, CW,   2, 135,  70, 10},     //
+  { 18100000, 26,  50, DIGI, 5, 255, 120, 30},     // ID0 soft ground,
+  { 21100000, 24,  40, CW,   5, 255, 200, 100},
+  { 24900000, 20,  36, CW,   7, 255, 255, 200},     // lowish output with high band filter
+  { 28100000, 18,  30, CW,   7, 255, 255, 200}      // low output with high band filter
 };
 
 // pin definitions
@@ -138,13 +141,16 @@ uint8_t s_tone;
 uint8_t kspeed = 14;
 
 const char msg1[] PROGMEM = "CDX Classic";
+const char msg2[] PROGMEM = "Wrong";
+const char msg3[] PROGMEM = "Filter";
+//const char msg4[] PROGMEM = " ";
 
 uint8_t transmitting;
 int tdown;
 
 uint8_t ad_ref = 0x40;        // 0x40 5 volt, 0xc0 is 1.1 volt ( +13db )
 uint8_t vol = 30;
-uint8_t svol = 20;
+uint8_t svol = 10;
 uint8_t sstate[1];            // button switch state array
 
 #define FREQ 0
@@ -154,6 +160,7 @@ uint8_t sstate[1];            // button switch state array
 uint8_t enc_user;
 
 int db_counter;               // !!! debug
+int db_counter2;
 
 
 void setup() {
@@ -182,7 +189,7 @@ void setup() {
    LCD.InitLCD();
    LCD.setFont(SmallFont);
    LCD.clrScr();
-   p_msg( msg1,0 );
+   p_msg( msg1,0,0 );
 
    si5351_init();
    set_timer2( T2_AUDIO );
@@ -245,7 +252,7 @@ static int sec;
      if( mode == CW ){
         keyer();
      }
-     if( mode == DIGI ){
+     if( mode == DIGI || mode == WSPR ){
        vox_check();
        if( transmitting ) send_tone();
      }
@@ -255,11 +262,12 @@ static int sec;
      }
 
      ++sec;
-     if( sec == 50 ){
+     if( sec == 100 ){
         sec = 0;
         //Serial.print(16); Serial.write(' '); Serial.print(-16); Serial.write(' ');
-        noInterrupts();   int val = db_counter; interrupts();
-        Serial.println( val );
+        noInterrupts();   int val = db_counter; int val2 = db_counter2;  interrupts();
+        Serial.print( val );   Serial.write(' ');
+        Serial.println( val2 );
      }
   }
 
@@ -286,6 +294,10 @@ int8_t pdl;
 }
 
 void side_tone_on(){
+uint8_t pwr;
+
+   pwr = ( mode == CW ) ? bandstack[band].cw_pwr : bandstack[band].digi_pwr;
+   if( mode == WSPR ) pwr = bandstack[band].wspr_pwr;
    
    if( mode == CW ) s_tone = 1;        // this function also keys tx during DIGI mode, but no side tone           
    if( transmitting == 0 ){
@@ -293,8 +305,8 @@ void side_tone_on(){
       i2cd( SI5351,3,0b11111011);
       i2flush();
    }
-   OCR2A = bandstack[band].cw_pwr;
-   digitalWrite( TXENABLE, HIGH );
+   OCR2A = pwr;                        // transmitter driver bias, power control
+   digitalWrite( TXENABLE, HIGH );     // key the driver stage VCC
    
 }
 
@@ -440,15 +452,22 @@ static int agc;
 //static int agc2;
 //static uint8_t bits;
 
-  // receiver
   ++state;
   state &= 7;
+
+  if( s_tone ){
+     if( state == 0 ) side_tone();
+     return;
+  }
+  if( transmitting ) return;
+
+  // receiver
   switch( state ){
     case 0:
       val = ADC - 512;               // read adc and que next conversion
       ADMUX = ad_ref | 0;            // conversion on channel zero 
       ADCSRA = 0xC0 + ADPS;
-     // db_counter = val;              // !!! debug
+      db_counter = val;              // !!! debug
     break;
     case 1:
       if( ++agc_counter == 0 ){
@@ -465,6 +484,7 @@ static int agc;
        val *= agc;
        val >>= 6;
        OCR2B = constrain(val+128,0,255);
+       db_counter2 = agc;        // !!! debug
        if( (abs(val)) > 2*(int)vol && agc > 0 ) --agc;     // volume ranges 0 to 63, signal +- 128
     break;
   }
@@ -482,6 +502,20 @@ uint16_t now;
    if( raw_tone > 5000 ) tone_flag = 1;    // else short count
 }
 
+
+// interrupt processing function
+void side_tone(){
+static uint8_t phase;
+int val;
+
+    phase += 5;
+    phase &= 63;
+
+    val = pgm_read_byte( &sin_cos[phase] );
+    val *= svol;
+    val >>= 6;
+    OCR2B = constrain(val+128,0,255);
+}
 
 uint8_t read_filter_id(){
 uint8_t id;
@@ -522,7 +556,7 @@ uint16_t divi;
   i2flush();
 
   mode = bandstack[band].mode;
-  if( mode == DIGI || mode == USB ) bfo = BFO - BW;
+  if( mode == DIGI || mode == USB || mode == WSPR ) bfo = BFO - BW;
   else bfo = BFO;
   
   divi = bandstack[band].r_div;
@@ -536,7 +570,7 @@ uint16_t divi;
   i2cd( SI5351, 3, 0b11111100 );      // enable vfo, bfo outputs, assumes rx is active
   i2flush();
   //delayMicroseconds(1500);            // same clock delay needed here?
-  if( mode == DIGI ) FSKON;
+  if( mode == DIGI || mode == WSPR ) FSKON;
   else FSKOFF;
 }
 
@@ -615,7 +649,7 @@ static float err;
       val =  16000000.0 / (float)raw;
       si_tone_offset( val );
 
-      db_counter = val;
+      //db_counter = val;
       // tone_testing( val );
    }
 
@@ -664,11 +698,11 @@ uint8_t j,i,k;                               // low, median, high
 
 
 // Less flash used by avoiding print string?
-void p_msg( const char *ptr, int row ){
+void p_msg( const char *ptr, int row, int col ){
 char c;
 
-   LCD.clrRow( row );
-   LCD.gotoRowCol( row, 0 );
+   LCD.clrRow( row,col );
+   LCD.gotoRowCol( row, col );
    while( ( c = pgm_read_byte(ptr++) ) ) LCD.putch(c);
    LCD.putch(' ');                      // make sure at least one write after gotoRowCol
   
@@ -1108,7 +1142,7 @@ int8_t s;
 uint8_t *svar[NUM_MENU] =                  // variables to change
 {&stp, &band, &mode, &kmode, &gain };
 uint8_t smax[NUM_MENU] =                   // max value allowed
-{ 4,      8,     4,      4,     2 };
+{ 4,      8,     5,      4,     2 };
 
 
 // tap inc value, dtap inc function, long change encoder user.  status_display
@@ -1161,7 +1195,7 @@ uint8_t ob;
 }
 
 const char status_msg[] PROGMEM = "StepBandModeKeyMGain";
-const char modes_msg[] PROGMEM = " CW DIGIUSB LSB ";
+const char modes_msg[] PROGMEM = " CW DIGIWSPRUSB LSB ";
 const char enc_msg[] PROGMEM = "FreqVol SVolKspd";
 void status_display( uint8_t f ){
 int i,k;
@@ -1189,6 +1223,7 @@ int i,k;
 
 void status_display2(){      // display encoder user status
 int i,k;
+uint8_t id;
 
   LCD.clrRow(1);
   LCD.gotoRowCol( 1,0 );
@@ -1206,6 +1241,21 @@ int i,k;
        LCD.printNumI( kspeed, 6*6,ROW1 );
     break;
   }
+
+    id = 0;
+    if( digitalRead( BAND_ID0 ) == HIGH ) id += 2;
+    if( digitalRead( BAND_ID1 ) == HIGH ) id += 4;
+
+    if( id != ( bandstack[band].filt_id & 6 ) ){
+       p_msg(msg2,0,64);
+       p_msg(msg3,1,64);
+    }
+   // else{
+   //    p_msg(msg4,0,64);
+   //    p_msg(msg4,1,64);
+   // }
+    
+
 
   
 }
