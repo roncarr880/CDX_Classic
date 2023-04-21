@@ -14,8 +14,13 @@
  *    TIMSK2  0x01 for overflow interrutps for audio
  *    Load OCR2A for bias value, OCR2B for audio
  *    
+ *  Timer1 is used in capture mode for audio tone detection.  
+ *    
  *  Turning clocks on and off or reseting Si5351 causes TX glitch.  Caused by capacitive coupling of the clock?
  *    Fixed by keying the driver circuit.
+ *    
+ *  Operation:  With SWAP_TAP_DTAP enabled, TAP cycles through through options that can be changed.  DTAP changes the value.
+ *    LONG_PRESS changes the function of the encoder( frequency, volume, side tone volume, keyer speed )
  *    
  */
 
@@ -64,9 +69,9 @@
 #define T2_BIAS 0x80
 #define T2_AUDIO 0x20
 
-#define BFO (9000000+400)        // bfo on the high side of the xtal filter ( set first, lsb? )
-#define BW  -2400                // band width of the xtal filter, bfo on low side is BFO - BW
-                                 // this works backwards from what I expected  
+#define BFO 9002800             // bfo on the high side of the xtal filter, USB
+#define BW  2900                // band width of the xtal filter, bfo on low side is BFO - BW
+ 
 
 //  I2C buffers and indexes
 unsigned int i2buf[I2TBUFSIZE];   // writes
@@ -103,7 +108,7 @@ struct BANDSTACK {
    uint16_t   r_div;      // rx vfo = freq + bfo
    uint16_t   t_div;      // tx vfo = freq
    uint8_t    mode;
-   uint8_t    filt_id;    // low pass filter ID for band selection, two bands per board, 4 boards possible, + ls bit is relay state
+   uint8_t    filt_id;    // low pass filter ID for band selection, two bands per board, 4 boards possible, bit2 band switch
    uint8_t    cw_pwr;     // pwm bias drive for modes
    uint8_t    digi_pwr;
    uint8_t    wspr_pwr;
@@ -112,13 +117,13 @@ struct BANDSTACK {
 #define NUMBANDS 8
 struct BANDSTACK bandstack[NUMBANDS] = {
   {  3928000, 54, 220, LSB,  0,  50,  25, 0},      //
-  {  7250000, 44, 122, LSB,  1,  50,  25, 0},      //
-  { 10138700, 36,  86, WSPR, 2,  55,  25, 0},      // ID1 soft ground low
-  { 14100000, 30,  62, CW,   2, 135,  70, 10},     //
-  { 18100000, 26,  50, DIGI, 5, 255, 120, 30},     // ID0 soft ground,
-  { 21100000, 24,  40, CW,   5, 255, 200, 100},
-  { 24900000, 20,  36, CW,   7, 255, 255, 200},     // lowish output with high band filter
-  { 28100000, 18,  30, CW,   7, 255, 255, 200}      // low output with high band filter
+  {  7250000, 44, 122, LSB,  4,  50,  25, 0},      //
+  { 10138700, 36,  86, WSPR, 1,  55,  25, 0},      // ID1 soft ground low
+  { 14100000, 30,  62, CW,   1, 135,  70, 10},     //
+  { 18100000, 26,  50, DIGI, 6, 255, 120, 30},     // ID0 soft ground, use higher rx filter on this board( bit2 set )
+  { 21100000, 24,  40, CW,   6, 255, 200, 100},
+  { 24900000, 20,  36, CW,   3, 255, 255, 200},     // lowish output with high band filter
+  { 28100000, 18,  30, CW,   3, 255, 255, 200}      // low output with high band filter
 };
 
 // pin definitions
@@ -205,7 +210,7 @@ void setup() {
 
    qsy(0);
    analogRead( A0 );                // init analog system
-   if( bandstack[band].filt_id & 1 ) digitalWrite(BAND_SW,HIGH);
+   if( bandstack[band].filt_id & 4 ) digitalWrite(BAND_SW,HIGH);
    else digitalWrite(BAND_SW,LOW);
 
    
@@ -524,10 +529,10 @@ uint8_t i;
 
    // get 1st band that has the matching filter ID of the lowpass filter installed
    band = id = 0;
-   if( digitalRead( BAND_ID0 ) == HIGH ) id += 2;
-   if( digitalRead( BAND_ID1 ) == HIGH ) id += 4;
+   if( digitalRead( BAND_ID0 ) == HIGH ) id += 1;
+   if( digitalRead( BAND_ID1 ) == HIGH ) id += 2;
    for( i = 0; i < NUMBANDS; ++i ){
-      if( id == ( bandstack[i].filt_id & 6 ) ){
+      if( id == ( bandstack[i].filt_id & 3 ) ){
          band = i;
          break;
       }
@@ -543,7 +548,7 @@ void band_change( uint8_t old_band ){
     freq = bandstack[band].freq;
     set_bfo();
     qsy(0);
-    if( bandstack[band].filt_id & 1 ) digitalWrite(BAND_SW,HIGH);
+    if( bandstack[band].filt_id & 4 ) digitalWrite(BAND_SW,HIGH);
     else digitalWrite(BAND_SW,LOW);
 
 }
@@ -556,7 +561,7 @@ uint16_t divi;
   i2flush();
 
   mode = bandstack[band].mode;
-  if( mode == DIGI || mode == USB || mode == WSPR ) bfo = BFO - BW;
+  if( mode == CW || mode == LSB ) bfo = BFO - BW;
   else bfo = BFO;
   
   divi = bandstack[band].r_div;
@@ -564,7 +569,6 @@ uint16_t divi;
   si_load_divider( divi, 0, 0 );       // divider for clock 0
   
   si_pll_x( PLLA, bfo, 98 );
-  //si_load_divider( 98, 2, 0 );        // keep clock 2 in step with clock 1 but disabled
   si_load_divider( 98, 1, 1 );        // clock 1, reset all
   i2flush();
   i2cd( SI5351, 3, 0b11111100 );      // enable vfo, bfo outputs, assumes rx is active
@@ -1243,19 +1247,17 @@ uint8_t id;
   }
 
     id = 0;
-    if( digitalRead( BAND_ID0 ) == HIGH ) id += 2;
-    if( digitalRead( BAND_ID1 ) == HIGH ) id += 4;
+    if( digitalRead( BAND_ID0 ) == HIGH ) id += 1;
+    if( digitalRead( BAND_ID1 ) == HIGH ) id += 2;
 
-    if( id != ( bandstack[band].filt_id & 6 ) ){
+    if( id != ( bandstack[band].filt_id & 3 ) ){     // write wrong filter message
        p_msg(msg2,0,64);
        p_msg(msg3,1,64);
     }
-   // else{
+   // else{                 // row already cleared
    //    p_msg(msg4,0,64);
    //    p_msg(msg4,1,64);
    // }
-    
-
 
   
 }
