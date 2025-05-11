@@ -19,15 +19,17 @@
  *  Turning clocks on and off or reseting Si5351 causes TX glitch.  Caused by capacitive coupling of the clock?
  *    Fixed by keying the driver circuit.
  *    
- *  Operation:  With SWAP_TAP_DTAP enabled, TAP cycles through through options that can be changed.  DTAP changes the value.
+ *  Operation:  DTAP cycles through options that can be changed, TAP changes the value.
+ *    With SWAP_TAP_DTAP enabled, TAP cycles through through options that can be changed.  DTAP changes the value.
  *    LONG_PRESS changes the function of the encoder( frequency, volume, side tone volume, keyer speed )
  *    
+ *  Notes:  My Nano has the old bootloader.
  */
 
-#define SWAP_TAP_DTAP 1         // swap the button tap and dtap, tap selects, dtap changes now 
+#define SWAP_TAP_DTAP 0         // swap the button tap and dtap, tap selects, dtap changes now 
 
 #define SI5351 0x60     // I2C address
-#define CLOCK_FREQ 25000045L
+#define CLOCK_FREQ 25000070L         // !!! +25 needed I think from 045
 //  starting addresses of phase lock loop registers
 #define PLLA 26
 #define PLLB 34
@@ -101,7 +103,7 @@ uint8_t  mode;
 uint8_t  band;
 int16_t   step_ = 1000;
 uint8_t   stp = 2;
-uint8_t  gain;
+uint8_t  gain = 1;        // ad ref gain 13db
 
 struct BANDSTACK {
    uint32_t   freq;
@@ -114,16 +116,17 @@ struct BANDSTACK {
    uint8_t    wspr_pwr;
 };
 
-#define NUMBANDS 8
+#define NUMBANDS 9
 struct BANDSTACK bandstack[NUMBANDS] = {
-  {  3928000, 54, 220, LSB,  0,  50,  25, 0},      //
+  {  3928000, 54, 220, LSB,  0,  50,  25, 0},      // no filter yet for 80 and 40
   {  7250000, 44, 122, LSB,  4,  50,  25, 0},      //
-  { 10138700, 36,  86, WSPR, 1,  55,  25, 0},      // ID1 soft ground low
+  { 10138700, 36,  86, WSPR, 1,  55,  25, 0},      // ID1 soft ground low, filter for 30 and 20 meters
   { 14100000, 30,  62, CW,   1, 135,  70, 10},     //
   { 18100000, 26,  50, DIGI, 6, 255, 120, 30},     // ID0 soft ground, use higher rx filter on this board( bit2 set )
-  { 21100000, 24,  40, CW,   6, 255, 200, 100},
-  { 24900000, 20,  36, CW,   3, 255, 255, 200},     // lowish output with high band filter
-  { 28100000, 18,  30, CW,   3, 255, 255, 200}      // low output with high band filter
+  { 21100000, 24,  40, CW,   6, 255, 200, 30},    // A filter designed for 10 meters works best on 17 and 15 meters
+  { 21100000, 24,  40, CW,   3, 255, 200, 30},    // this 2nd filter for 10 and 12 meters also covers 15 meters
+  { 24924600, 20,  36, WSPR, 3, 255, 255, 31},    // 30  = just warm tx. 60  = hot, no led on ant tuner with both.
+  { 28124600, 18,  30, WSPR, 3, 255, 255, 60}
 };
 
 // pin definitions
@@ -165,7 +168,7 @@ uint8_t sstate[1];            // button switch state array
 uint8_t enc_user;
 
 int db_counter;               // !!! debug
-int db_counter2;
+float db_counter2;
 
 
 void setup() {
@@ -270,9 +273,11 @@ static int sec;
      if( sec == 100 ){
         sec = 0;
         //Serial.print(16); Serial.write(' '); Serial.print(-16); Serial.write(' ');
-        noInterrupts();   int val = db_counter; int val2 = db_counter2;  interrupts();
+        noInterrupts();   int val = db_counter;   interrupts();
+        db_counter2 = 99.0 * db_counter2 + abs( val );
+        db_counter2 /= 100.0;
         Serial.print( val );   Serial.write(' ');
-        Serial.println( val2 );
+        Serial.println( db_counter2 );
      }
   }
 
@@ -469,7 +474,7 @@ static int agc;
   // receiver
   switch( state ){
     case 0:
-      val = ADC - 512;               // read adc and que next conversion
+      val = ADC - 510;               // read adc and que next conversion
       ADMUX = ad_ref | 0;            // conversion on channel zero 
       ADCSRA = 0xC0 + ADPS;
       db_counter = val;              // !!! debug
@@ -489,7 +494,7 @@ static int agc;
        val *= agc;
        val >>= 6;
        OCR2B = constrain(val+128,0,255);
-       db_counter2 = agc;        // !!! debug
+       //db_counter2 = agc;        // !!! debug
        if( (abs(val)) > 2*(int)vol && agc > 0 ) --agc;     // volume ranges 0 to 63, signal +- 128
     break;
   }
@@ -609,6 +614,7 @@ void qsy( int val ){
 
    freq += val;
    display_freq();
+   disp_band_limit();
    si_pll_x( PLLB, freq+bfo, bandstack[band].r_div);
   
 }
@@ -1146,7 +1152,7 @@ int8_t s;
 uint8_t *svar[NUM_MENU] =                  // variables to change
 {&stp, &band, &mode, &kmode, &gain };
 uint8_t smax[NUM_MENU] =                   // max value allowed
-{ 4,      8,     5,      4,     2 };
+{ 4,      9,     5,      4,     2 };
 
 
 // tap inc value, dtap inc function, long change encoder user.  status_display
@@ -1260,4 +1266,85 @@ uint8_t id;
    // }
 
   
+}
+
+
+
+#define OOB 0
+#define EX 1
+#define GCW 2
+#define ADV 3
+#define GEN 4
+
+struct BAND_LIMITS {
+   char band;
+   long freq;
+   char type;
+};
+
+#define NUM_LIMITS 34
+
+struct BAND_LIMITS band_limits[ NUM_LIMITS ] = {
+   { 0,  3500000, EX  },
+   { 0,  3525000, GCW },
+   { 0,  3600000, EX  },
+   { 0,  3700000, ADV },
+   { 0,  3800000, GEN },
+   { 0,  4000000, OOB },
+
+   { 1,  7000000, EX  },
+   { 1,  7025000, GCW },
+   { 1,  7125000, ADV },
+   { 1,  7175000, GEN },
+   { 1,  7300000, OOB },
+
+   { 2, 10100000, GCW },
+   { 2, 10150000, OOB },
+
+   { 3, 14000000, EX  },
+   { 3, 14025000, GCW },
+   { 3, 14150000, EX  },
+   { 3, 14175000, ADV },
+   { 3, 14225000, GEN },
+   { 3, 14350000, OOB },
+
+   { 4, 18068000, GCW },
+   { 4, 18110000, GEN },
+   { 4, 18168000, OOB },
+
+   { 5, 21000000, EX  },
+   { 5, 21025000, GCW },
+   { 5, 21200000, EX  },
+   { 5, 21225000, ADV },
+   { 5, 21275000, GEN },
+   { 5, 21450000, OOB },
+
+   { 6, 24890000, GCW },
+   { 6, 24930000, GEN },
+   { 6, 24990000, OOB },
+
+   { 7, 28000000, GCW },
+   { 7, 28300000, GEN },
+   { 7, 29700000, OOB }
+};
+
+char limit_str[] = "oobex cw advgen";
+
+void disp_band_limit(){
+char type;
+char i;
+
+   type = OOB;
+
+   for( i = 0; i < NUM_LIMITS; ++i ){
+      if( band == band_limits[i].band ){
+          if( freq >= band_limits[i].freq ) type = band_limits[i].type;
+      }
+   }
+
+   type *= 3;
+   LCD.gotoRowCol( 1,127-4*6 );
+   for( i = 0; i < 3; ++i ) LCD.putch( limit_str[type++] );
+   LCD.putch(' ');
+      
 }
