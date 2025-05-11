@@ -1333,11 +1333,13 @@ char limit_str[] = "oobex cw advgen";
 void disp_band_limit(){
 char type;
 char i;
+char k;
 
    type = OOB;
+   k = ( band > 5 ) ? band - 1 : band;    // 15 meters duplicated in bandstack for use with two filters
 
    for( i = 0; i < NUM_LIMITS; ++i ){
-      if( band == band_limits[i].band ){
+      if( k == band_limits[i].band ){
           if( freq >= band_limits[i].freq ) type = band_limits[i].type;
       }
    }
